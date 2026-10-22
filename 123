@@ -1,8 +1,63 @@
-cd /tmp
-URL=$(curl -s https://api.github.com/repos/rustdesk/rustdesk/releases/latest \
-  | grep browser_download_url \
-  | grep 'x86_64.deb' \
-  | cut -d '"' -f 4 | head -n 1)
-echo "$URL"
-wget "$URL" -O rustdesk.deb
-sudo apt install -y ./rustdesk.deb
+cat > dlpdb-check.sh <<'DLPDB_SCRIPT_END'
+#!/bin/bash
+# Is the DLP report database reachable from THIS box, with a read-only account? (AI Chat: DB_SEARCH_*; UEBA: UEBA_DLP_*)
+#   sudo bash dlpdb-check.sh                      reads the URI/DB from /etc/dlpai/{openwebui,ueba}.env and /etc/dlpai/environment
+#   DLPDB_URL=mongodb://... DLPDB_NAME=x bash dlpdb-check.sh      test one explicit target (no root needed)
+# Read-only: it never writes. The password is never printed.
+set -uo pipefail
+PY=/opt/dlpai/current/env/bin/python; [ -x "$PY" ] || PY=python3
+envget() { for f in "$@"; do [ -r "$f" ] && grep -E "^$KEY=" "$f" | tail -1 | cut -d= -f2- && return; done; }
+check_one() { # label url db
+  echo "== $1"
+  [ -n "$2" ] && [ -n "$3" ] || { echo "  - not configured (URL or database name empty)"; return 0; }
+  DLPDB_URL="$2" DLPDB_NAME="$3" "$PY" - <<'PY'
+import os, re, socket, sys, time
+from urllib.parse import urlparse
+url, name = os.environ["DLPDB_URL"], os.environ["DLPDB_NAME"]
+u = urlparse(url if "://" in url else "mongodb://" + url)
+host, port = u.hostname, u.port or 27017
+masked = re.sub(r"//[^@/]*@", "//***@", url)
+print("  target: %s  db=%s  user=%s" % (masked, name, u.username or "(none)"))
+t = time.time()
+try:
+    socket.create_connection((host, port), 5).close(); print("  ✔️ tcp %s:%s open (%.0f ms)" % (host, port, (time.time()-t)*1000))
+except Exception as e:
+    print("  ✗ tcp %s:%s -> %s: network/firewall/bind address, not a credentials problem" % (host, port, type(e).__name__)); sys.exit(0)
+try:
+    from pymongo import MongoClient
+except Exception:
+    print("  ✗ pymongo missing"); sys.exit(0)
+c = MongoClient(url, serverSelectionTimeoutMS=6000)
+try:
+    c.admin.command("ping"); print("  ✔️ mongod answers ping")
+except Exception as e:
+    print("  ✗ ping/auth failed: %s: %s" % (type(e).__name__, str(e)[:160])); sys.exit(0)
+db = c[name]
+try:
+    cols = db.list_collection_names(); print("  ✔️ database '%s' visible: %d collections" % (name, len(cols)))
+except Exception as e:
+    print("  ✗ cannot list collections of '%s': %s (account has no read on this database?)" % (name, type(e).__name__)); sys.exit(0)
+if not cols: print("  ! database exists but is EMPTY (wrong database name?)")
+for col in ("clients", "incidents", "agentsessions"):
+    if col in cols:
+        try: print("  ✔️ read %-14s ~%d documents" % (col, db[col].estimated_document_count()))
+        except Exception as e: print("  ✗ read %s: %s" % (col, type(e).__name__))
+    else: print("  - collection %s not present" % col)
+try:
+    st = c.admin.command({"connectionStatus": 1, "showPrivileges": True})["authInfo"]
+    acts = {a for p in st.get("authenticatedUserPrivileges", []) for a in p.get("actions", [])}
+    writes = sorted(acts & {"insert", "update", "remove", "dropCollection", "dropDatabase", "createCollection", "createIndex"})
+    if not st.get("authenticatedUsers"): print("  ! no authentication: the server answers anonymous clients (no account is used)")
+    elif writes: print("  ✗ account can WRITE (%s): give AI Chat/UEBA a read-only account" % ", ".join(writes))
+    else: print("  ✔️ account is read-only")
+except Exception as e:
+    print("  ? could not read the account's privileges: %s" % type(e).__name__)
+PY
+}
+if [ -n "${DLPDB_URL:-}" ]; then check_one "explicit target" "$DLPDB_URL" "${DLPDB_NAME:-}"; exit 0; fi
+KEY=DB_SEARCH_MONGO_URL; U1="$(envget /etc/dlpai/openwebui.env /etc/dlpai/environment)"; KEY=DB_SEARCH_DATABASE; D1="$(envget /etc/dlpai/openwebui.env /etc/dlpai/environment)"
+KEY=UEBA_DLP_MONGO_URL;  U2="$(envget /etc/dlpai/ueba.env /etc/dlpai/environment)";           KEY=UEBA_DLP_DB;         D2="$(envget /etc/dlpai/ueba.env /etc/dlpai/environment)"
+check_one "AI Chat (DB_SEARCH_*)" "$U1" "$D1"
+check_one "UEBA (UEBA_DLP_*)" "$U2" "$D2"
+DLPDB_SCRIPT_END
+sudo bash dlpdb-check.sh
