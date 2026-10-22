@@ -1,0 +1,35 @@
+cat > dlpai-tool-test.sh <<'DLPAI_TOOLTEST_END'
+#!/bin/bash
+# Runs the AI Chat data tool WITHOUT the model, as an admin, against the DB configured for AI Chat. Read-only.
+#   sudo bash dlpai-tool-test.sh
+set -uo pipefail
+ENVF="${ENVF:-/etc/dlpai/openwebui.env}"; [ -r "$ENVF" ] || ENVF=/etc/dlpai/environment
+PY=/opt/dlpai/current/env/bin/python
+ENVF="$ENVF" "$PY" - <<'PY'
+import json, os, sys
+envf = os.environ["ENVF"]
+for line in open(envf, encoding="utf-8"):
+    k, _, v = line.rstrip("\n").partition("=")
+    if k in ("DB_SEARCH_MONGO_URL", "DB_SEARCH_DATABASE") and v.strip():
+        os.environ[k] = v.strip().strip('"').strip("'")
+print("env file:", envf, "| DB_SEARCH_DATABASE =", os.environ.get("DB_SEARCH_DATABASE", "(missing)"),
+      "| DB_SEARCH_MONGO_URL set:", bool(os.environ.get("DB_SEARCH_MONGO_URL")))
+sys.path.insert(0, "/opt/dlpai/current/app/owui/tools")
+try:
+    import datagaze_data as m
+except Exception as e:
+    print("cannot import the tool:", type(e).__name__, e); sys.exit(1)
+admin = {"role": "admin", "id": "support-test"}
+for q in ('{"collection":"clients","limit":1,"projection":{"_id":1}}', '{"collection":"incidents","limit":1,"projection":{"_id":1}}'):
+    try:
+        out = m.run_query(q, admin, group_ids=[])
+        d = json.loads(out)
+    except Exception as e:
+        print("tool call crashed:", type(e).__name__, str(e)[:200]); continue
+    if d.get("status") == "failed" or "error" in d:
+        print("FAILED :", d.get("error"))
+    else:
+        print("OK     : %-10s matching_count=%s" % (json.loads(q)["collection"], d.get("matching_count")))
+PY
+DLPAI_TOOLTEST_END
+sudo bash dlpai-tool-test.sh
